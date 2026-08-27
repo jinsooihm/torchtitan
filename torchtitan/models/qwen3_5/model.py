@@ -134,6 +134,8 @@ class Qwen35Attention(BaseAttention):
         x_TD: torch.Tensor,
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
+        *,
+        rope_cache: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_tokens = x_TD.shape[0]
 
@@ -157,7 +159,14 @@ class Qwen35Attention(BaseAttention):
             xk_TNH[..., : self.rotary_dim],
             xk_TNH[..., self.rotary_dim :],
         )
-        xq_TNR, xk_TNR = self.rope(xq_TNR, xk_TNR, positions)
+        if rope_cache is None:
+            xq_TNR, xk_TNR = self.rope(xq_TNR, xk_TNR, positions)
+        else:
+            xq_TNR, xk_TNR = self.rope.apply_rotary_emb(
+                xq_TNR,
+                xk_TNR,
+                rope_cache,
+            )
         xq_TNH = torch.cat([xq_TNR, xq_TNP], dim=-1)
         xk_TNH = torch.cat([xk_TNR, xk_TNP], dim=-1)
 
@@ -220,13 +229,20 @@ class Qwen35TransformerBlock(Module):
         x_TD: torch.Tensor,
         attention_masks: Qwen35AttentionMaskDict | None,
         positions: torch.Tensor | None = None,
+        *,
+        rope_cache: torch.Tensor | None = None,
     ) -> torch.Tensor:
         layer_mask = (
             attention_masks[self.attn_mask_key] if attention_masks is not None else None
         )
         h_TD = self.attention_norm(x_TD)
         if self.full_attn:
-            h_TD = self.attn(h_TD, layer_mask, positions)
+            h_TD = self.attn(
+                h_TD,
+                layer_mask,
+                positions,
+                rope_cache=rope_cache,
+            )
         else:
             h_TD = self.attn(h_TD, layer_mask)
         x_TD = x_TD + h_TD
@@ -417,6 +433,7 @@ class Qwen35Model(Decoder):
                 parallelism.context_parallel_load_balancer,
                 parallelism.context_parallel_ptrr_mask_key,
             )
+        self._maybe_add_prepared_rope_cache(batch)
         if parallelism.spmd_backend == "spmd_types":
             batch = annotate_input_spmd_types(parallel_dims, batch, input_sharding)
             # Plain-tensor inputs are typed above; the GatedDeltaNet cu_seq_q,
@@ -571,6 +588,7 @@ class Qwen35Model(Decoder):
         grid_thw_videos: torch.Tensor | None = None,
         attention_masks: Qwen35AttentionMaskDict | None = None,
         positions: torch.Tensor | None = None,
+        rope_cache: torch.Tensor | None = None,
         special_tokens: dict[str, int] | None = None,
     ):
         with multimodal_context():
@@ -597,7 +615,12 @@ class Qwen35Model(Decoder):
         # 2D (batch, seq) for text; ``preprocess_inputs`` resolved which one to
         # forward. The per-layer MRoPE dispatches on rank.
         for layer in self.layers.values():
-            x = layer(x, attention_masks, positions)
+            x = layer(
+                x,
+                attention_masks,
+                positions,
+                rope_cache=rope_cache,
+            )
 
         x = self.norm(x) if self.norm is not None else x
         if self._skip_lm_head:

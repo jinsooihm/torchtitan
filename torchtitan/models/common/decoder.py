@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import dataclasses
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -33,11 +33,40 @@ from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import MoE
 from torchtitan.models.common.nn_modules import RMSNorm
+from torchtitan.models.common.rope import RoPE
 from torchtitan.models.common.token_dispatcher import update_ep_token_dispatcher_config
 from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.module import Module, ModuleDict
 
 __all__ = ["Decoder", "TransformerBlock"]
+
+
+def _iter_decoder_layer_configs(config) -> Iterable:
+    yield from getattr(config, "layers", [])
+    yield from getattr(config, "mtp_layers", [])
+
+
+def _shared_decoder_rope_config(config) -> RoPE.Config | None:
+    """Return the single active decoder RoPE config, or None if there is none."""
+    rope_config: RoPE.Config | None = None
+    for layer in _iter_decoder_layer_configs(config):
+        attention = getattr(layer, "attention", None)
+        if attention is None:
+            continue
+        if not getattr(attention, "use_rope", True):
+            continue
+        candidate = getattr(attention, "rope", None)
+        if candidate is None:
+            continue
+        if rope_config is None:
+            rope_config = candidate
+            continue
+        if candidate != rope_config:
+            raise ValueError(
+                "Model-owned RoPE cache requires one active decoder RoPE "
+                f"contract, got both {rope_config} and {candidate}."
+            )
+    return rope_config
 
 
 # TODO: we can unify the TransformerBlock impl across all models when
@@ -260,6 +289,15 @@ class Decoder(BaseModel):
         for i, layer_config in enumerate(config.layers):
             self.layers[str(i)] = layer_config.build()
 
+        self._rope_config = _shared_decoder_rope_config(config)
+        if self._rope_config is not None:
+            self.register_buffer(
+                "rope_cache",
+                self._rope_config.build().cache,
+                persistent=False,
+            )
+            self._retie_layer_rope_caches()
+
         self.norm = config.norm.build()
         self.lm_head = config.lm_head.build()
 
@@ -280,12 +318,55 @@ class Decoder(BaseModel):
             assert self.tok_embeddings is not None and self.lm_head is not None
             self.tok_embeddings.weight = self.lm_head.weight
         super().init_states(buffer_device=buffer_device)
+        self._retie_layer_rope_caches()
+
+    def _init_self_buffers(
+        self,
+        *,
+        buffer_device: torch.device | None = None,
+    ) -> None:
+        if self._rope_config is None:
+            return
+        if buffer_device is None:
+            buffer_device = self.rope_cache.device
+        with torch.device(buffer_device):
+            self.rope_cache = self._rope_config.build().cache
+
+    def _iter_layer_rope_modules(self) -> Iterable[RoPE]:
+        for layer in self.layers.values():
+            attention = getattr(layer, "attention", None)
+            rope = getattr(attention, "rope", None)
+            if rope is not None:
+                yield rope
+
+        mtp_layers = getattr(self, "mtp_layers", None)
+        if mtp_layers is None:
+            return
+        for layer in mtp_layers:
+            attention = getattr(layer, "attention", None)
+            rope = getattr(attention, "rope", None)
+            if rope is not None:
+                yield rope
+
+    def _retie_layer_rope_caches(self) -> None:
+        if self._rope_config is None:
+            return
+        rope_cache = self.rope_cache
+        for rope in self._iter_layer_rope_modules():
+            if rope.config == self._rope_config:
+                rope.cache = rope_cache
+
+    def parallelize(self, parallel_dims: ParallelDims) -> None:
+        super().parallelize(parallel_dims)
+        self._retie_layer_rope_caches()
 
     def forward(
         self,
         tokens: torch.Tensor,
         positions: torch.Tensor | None = None,
         attention_masks: AttentionMasksType | None = None,
+        *,
+        rope_cache: torch.Tensor | None = None,
     ):
         # positions is listed before attention_masks so AutoParallel's input_fn,
         # which returns (tokens, positions) and binds them positionally, maps
@@ -295,7 +376,12 @@ class Decoder(BaseModel):
         h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
 
         for layer in self.layers.values():
-            h = layer(h, attention_masks, positions)
+            h = layer(
+                h,
+                attention_masks,
+                positions,
+                rope_cache=rope_cache,
+            )
 
         h = self.norm(h) if self.norm is not None else h
 
@@ -348,6 +434,18 @@ class Decoder(BaseModel):
             ],
         )
 
+    def _maybe_add_prepared_rope_cache(self, batch: dict[str, Any]) -> None:
+        if self._rope_config is None:
+            return
+        positions = batch.get("positions", None)
+        if positions is None:
+            return
+        batch["rope_cache"] = self._rope_config.prepare_cache(
+            self.rope_cache,
+            positions=positions,
+            num_tokens=positions.shape[0],
+        )
+
     def preprocess_inputs(
         self,
         input_dict: dict[str, torch.Tensor],
@@ -378,6 +476,7 @@ class Decoder(BaseModel):
                 parallelism.context_parallel_load_balancer,
                 parallelism.context_parallel_ptrr_mask_key,
             )
+        self._maybe_add_prepared_rope_cache(batch)
         if parallelism.spmd_backend == "spmd_types":
             batch = annotate_input_spmd_types(parallel_dims, batch, input_sharding)
 

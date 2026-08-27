@@ -99,6 +99,8 @@ class Attention(BaseAttention):
         x: torch.Tensor,
         attention_masks: AttentionMasksType,
         positions: torch.Tensor | None = None,
+        *,
+        rope_cache: torch.Tensor | None = None,
     ):
         num_tokens = x.shape[0]
 
@@ -127,7 +129,11 @@ class Attention(BaseAttention):
         kv = self.wkv_a(x)
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
 
-        q_pe, k_pe = self.rope(q_pe, k_pe.unsqueeze(1), positions)
+        k_pe = k_pe.unsqueeze(1)
+        if rope_cache is None:
+            q_pe, k_pe = self.rope(q_pe, k_pe, positions)
+        else:
+            q_pe, k_pe = self.rope.apply_rotary_emb(q_pe, k_pe, rope_cache)
         q = torch.cat([q_nope, q_pe], dim=-1)
 
         kv = self.wkv_b(self.kv_norm(kv))
@@ -183,8 +189,15 @@ class DeepSeekV3TransformerBlock(TransformerBlock):
         x: torch.Tensor,
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
+        *,
+        rope_cache: torch.Tensor | None = None,
     ):
-        x = x + self.attention(self.attention_norm(x), attention_masks, positions)
+        x = x + self.attention(
+            self.attention_norm(x),
+            attention_masks,
+            positions,
+            rope_cache=rope_cache,
+        )
         if self.moe_enabled:
             x = x + self.moe(self.ffn_norm(x))
         else:

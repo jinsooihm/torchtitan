@@ -132,6 +132,7 @@ class KimiK25Model(DeepSeekV3Model):
                 parallelism.context_parallel_load_balancer,
                 parallelism.context_parallel_ptrr_mask_key,
             )
+        self._maybe_add_prepared_rope_cache(batch)
         if parallelism.spmd_backend == "spmd_types":
             batch = annotate_input_spmd_types(parallel_dims, batch, input_sharding)
 
@@ -208,6 +209,7 @@ class KimiK25Model(DeepSeekV3Model):
         special_tokens: dict[str, int] | None = None,
         attention_masks: AttentionMasksType | None = None,
         positions: torch.Tensor | None = None,
+        rope_cache: torch.Tensor | None = None,
     ):
         """Forward pass for Kimi K2.5.
 
@@ -248,7 +250,12 @@ class KimiK25Model(DeepSeekV3Model):
             spmd.assert_type(x, {"dp": spmd.S(0), "tp": spmd.R})
 
         for layer in self.layers.values():
-            x = layer(x, attention_masks, positions)
+            x = layer(
+                x,
+                attention_masks,
+                positions,
+                rope_cache=rope_cache,
+            )
 
         x = self.norm(x) if self.norm is not None else x
         if self._skip_lm_head:

@@ -73,6 +73,18 @@ def token_id_placement() -> SpmdType:
     )
 
 
+def rope_cache_placement() -> SpmdType:
+    """Placement for prepared RoPE cache with shape ``(tokens, 1, width)``."""
+    return SpmdType(
+        {
+            DP: spmd.V,
+            CP: spmd.V,
+            TP: spmd.R,
+        },
+        partition_spec=spmd.PartitionSpec((DP, CP), None, None),
+    )
+
+
 def attention_activation_placement(
     *, cp: spmd.PerMeshAxisSpmdType = spmd.S(0)
 ) -> SpmdType:
@@ -112,6 +124,7 @@ def decoder_input_sharding() -> dict[str, SpmdType]:
     return {
         "input": token_id_placement(),
         "positions": token_id_placement(),
+        "rope_cache": rope_cache_placement(),
         "labels": SpmdType(
             {DP: spmd.V, CP: spmd.V, TP: spmd.I},
             partition_spec=spmd.PartitionSpec((DP, CP)),
@@ -250,10 +263,6 @@ def set_gqa_attention_sharding(attention_cfg, *, enable_sp: bool) -> None:
             },
         )
     )
-    if attention_cfg.rope is not None:
-        attention_cfg.rope.sharding_config = ShardingConfig(
-            state_shardings={"cache": dense_param_placement(tp=spmd.R)},
-        )
     set_qkv_linear_sharding(attention_cfg.qkv_linear)
 
     wo_config = rowwise_config(output_sp=enable_sp)
@@ -369,6 +378,9 @@ def set_decoder_sharding_config(config, *, enable_sp: bool) -> None:
     )
     embed_out_src = dense_activation_placement(tp=spmd.P, cp=spmd.S(0))
     embed_input = token_id_placement()
+    config.sharding_config = ShardingConfig(
+        state_shardings={"rope_cache": dense_param_placement(tp=spmd.R)},
+    )
     config.tok_embeddings.sharding_config = ShardingConfig(
         state_shardings={"weight": dense_param_placement(tp=spmd.S(0))},
         in_src_shardings={"input": embed_input},

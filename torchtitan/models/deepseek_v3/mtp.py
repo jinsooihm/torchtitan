@@ -145,6 +145,8 @@ class MTPTransformerBlock(TransformerBlock):
         mtp_input_valid_mask: torch.Tensor,
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
+        *,
+        rope_cache: torch.Tensor | None = None,
     ):
         mtp_input_valid_mask = mtp_input_valid_mask.unsqueeze(-1).to(
             dtype=prev_embed.dtype
@@ -153,7 +155,12 @@ class MTPTransformerBlock(TransformerBlock):
         h = self.eh_proj(
             torch.cat([self.enorm(mtp_input_embed), self.hnorm(prev_embed)], dim=-1)
         )
-        h = h + self.attention(self.attention_norm(h), attention_masks, positions)
+        h = h + self.attention(
+            self.attention_norm(h),
+            attention_masks,
+            positions,
+            rope_cache=rope_cache,
+        )
         if self.moe_enabled:
             h = h + self.moe(self.ffn_norm(h))
         else:
@@ -219,15 +226,23 @@ class MTPDecoder(Decoder):
                     "MTPTransformerBlock.Config instances."
                 )
             self.mtp_layers.append(layer_config.build())
+        self._retie_layer_rope_caches()
 
     def forward(
         self,
         tokens: torch.Tensor,
         positions: torch.Tensor | None = None,
         attention_masks: AttentionMasksType | None = None,
+        *,
+        rope_cache: torch.Tensor | None = None,
     ):
         if self.mtp_layers is None:
-            return super().forward(tokens, positions, attention_masks)
+            return super().forward(
+                tokens,
+                positions,
+                attention_masks,
+                rope_cache=rope_cache,
+            )
         if self.tok_embeddings is None:
             raise ValueError("MTP decoder forward requires token embeddings.")
 
@@ -235,7 +250,12 @@ class MTPDecoder(Decoder):
         # hidden state because MTP consumes the last decoder-layer output.
         h = self.tok_embeddings(tokens)
         for layer in self.layers.values():
-            h = layer(h, attention_masks, positions)
+            h = layer(
+                h,
+                attention_masks,
+                positions,
+                rope_cache=rope_cache,
+            )
 
         prev_depth_hidden = h
         h = self.norm(h) if self.norm is not None else h
@@ -261,6 +281,7 @@ class MTPDecoder(Decoder):
                 mtp_input_valid_mask,
                 attention_masks,
                 positions,
+                rope_cache=rope_cache,
             )
             mtp_outputs.append(prev_depth_hidden)
 

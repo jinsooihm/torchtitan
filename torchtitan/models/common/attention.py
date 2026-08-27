@@ -951,6 +951,8 @@ class GQAttention(BaseAttention):
         x_TD: torch.Tensor,
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
+        *,
+        rope_cache: torch.Tensor | None = None,
     ) -> torch.Tensor:
         xq_TNH, xk_TNH, xv_TNH = self.qkv_linear(x_TD)
 
@@ -960,8 +962,15 @@ class GQAttention(BaseAttention):
             xq_TNH = self.q_norm(xq_TNH)
             xk_TNH = self.k_norm(xk_TNH)
 
-        # Apply rotary embeddings
-        xq_TNH, xk_TNH = self.rope(xq_TNH, xk_TNH, positions)
+        # Apply rotary embeddings.
+        if rope_cache is None:
+            xq_TNH, xk_TNH = self.rope(xq_TNH, xk_TNH, positions)
+        else:
+            xq_TNH, xk_TNH = self.rope.apply_rotary_emb(
+                xq_TNH,
+                xk_TNH,
+                rope_cache,
+            )
 
         out_TNH = self.inner_attention(
             xq_TNH,

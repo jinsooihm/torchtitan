@@ -51,8 +51,9 @@ class _RecordingLayer(nn.Module):
         super().__init__()
         self._sink = sink
 
-    def forward(self, x, attention_masks=None, positions=None):
+    def forward(self, x, attention_masks=None, positions=None, *, rope_cache=None):
         self._sink["positions"] = positions
+        self._sink["rope_cache"] = rope_cache
         return x
 
 
@@ -96,6 +97,9 @@ class TestQwen35MRoPEPositions(unittest.TestCase):
 
         # No mrope: layers see the plain 1D positions.
         self.assertTrue(torch.equal(sink["positions"], positions))
+        self.assertIn("rope_cache", sink)
+        self.assertIsNotNone(sink["rope_cache"])
+        self.assertEqual(sink["rope_cache"].shape[0], positions.shape[0])
         # Masks come from the 1D positions.
         self.assertEqual(
             batch["attention_masks"]["deltanet"].cu_seq_q_host, (0, 3, 5, 10)
@@ -124,6 +128,15 @@ class TestQwen35MRoPEPositions(unittest.TestCase):
         self.assertEqual(sink["positions"].ndim, 2)
         self.assertEqual(sink["positions"].shape[-1], 3)
         self.assertTrue(torch.equal(sink["positions"], mrope_positions))
+        self.assertIn("rope_cache", sink)
+        self.assertIsNotNone(sink["rope_cache"])
+        self.assertEqual(sink["rope_cache"].shape[0], positions.shape[0])
+        expected = model._rope_config.prepare_cache(
+            model.rope_cache,
+            positions=mrope_positions,
+            num_tokens=mrope_positions.shape[0],
+        )
+        torch.testing.assert_close(sink["rope_cache"], expected)
         # Masks are still built from the 1D positions, not the mrope positions.
         self.assertEqual(
             batch["attention_masks"]["deltanet"].cu_seq_q_host, (0, 3, 5, 10)

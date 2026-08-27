@@ -91,6 +91,8 @@ class Attention(BaseAttention):
         x: torch.Tensor,
         attention_masks: AttentionMasksType,
         positions: torch.Tensor | None = None,
+        *,
+        rope_cache: torch.Tensor | None = None,
     ):
         """
         Forward pass for the Multi-Head Latent Attention (MLA) Layer.
@@ -107,7 +109,10 @@ class Attention(BaseAttention):
 
         q, k, v = self.qkv_linear(x)
 
-        q, k = self.rope(q, k, positions)
+        if rope_cache is None:
+            q, k = self.rope(q, k, positions)
+        else:
+            q, k = self.rope.apply_rotary_emb(q, k, rope_cache)
 
         output = self.inner_attention(
             q,
@@ -161,6 +166,8 @@ class GptOssTransformerBlock(TransformerBlock):
         x: torch.Tensor,
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
+        *,
+        rope_cache: torch.Tensor | None = None,
     ):
         """
         Forward pass for the Transformer block.
@@ -181,7 +188,12 @@ class GptOssTransformerBlock(TransformerBlock):
         if isinstance(attention_masks, dict):  # flex
             attention_masks = attention_masks[self.attn_mask_key]
 
-        x = x + self.attention(self.attention_norm(x), attention_masks, positions)
+        x = x + self.attention(
+            self.attention_norm(x),
+            attention_masks,
+            positions,
+            rope_cache=rope_cache,
+        )
         x = x + self.moe(self.ffn_norm(x))
         return x
 

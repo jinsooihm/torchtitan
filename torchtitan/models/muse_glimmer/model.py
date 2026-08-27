@@ -116,6 +116,8 @@ class Attention(GQAttention):
         x_TD: torch.Tensor,
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
+        *,
+        rope_cache: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_tokens = x_TD.shape[0]
         xq, xk, xv = self.qkv_linear(x_TD)
@@ -129,7 +131,10 @@ class Attention(GQAttention):
 
         # iRoPE: RoPE is skipped on NoPE layers (config-driven per layer).
         if self.use_rope:
-            xq, xk = self.rope(xq, xk, positions)
+            if rope_cache is None:
+                xq, xk = self.rope(xq, xk, positions)
+            else:
+                xq, xk = self.rope.apply_rotary_emb(xq, xk, rope_cache)
 
         # Select this layer's mask by its window ("global" key = full attention).
         # Only flex passes a window-keyed dict of BlockMasks to index into. Varlen
@@ -182,9 +187,16 @@ class MuseGlimmerTransformerBlock(TransformerBlock):
         x: torch.Tensor,
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
+        *,
+        rope_cache: torch.Tensor | None = None,
     ):
         h = x + self.post_attention_norm(
-            self.attention(self.attention_norm(x), attention_masks, positions)
+            self.attention(
+                self.attention_norm(x),
+                attention_masks,
+                positions,
+                rope_cache=rope_cache,
+            )
         )
         out = h + self.post_ffn_norm(self.feed_forward(self.ffn_norm(h)))
         return out
@@ -399,6 +411,7 @@ class MuseGlimmerModel(Decoder):
                 parallelism.context_parallel_load_balancer,
                 parallelism.context_parallel_ptrr_mask_key,
             )
+        self._maybe_add_prepared_rope_cache(batch)
         if parallelism.spmd_backend == "spmd_types":
             batch = annotate_input_spmd_types(parallel_dims, batch, input_sharding)
 
@@ -428,6 +441,7 @@ class MuseGlimmerModel(Decoder):
         positions: torch.Tensor | None = None,
         attention_masks: AttentionMasksType | None = None,
         *,
+        rope_cache: torch.Tensor | None = None,
         pixel_values: torch.Tensor | None = None,
         grid_thw: torch.Tensor | None = None,
         pixel_values_videos: torch.Tensor | None = None,
@@ -510,7 +524,12 @@ class MuseGlimmerModel(Decoder):
             spmd.assert_type(h, {"dp": spmd.S(0), "tp": spmd.R})
 
         for layer in self.layers.values():
-            h = layer(h, attention_masks, positions)
+            h = layer(
+                h,
+                attention_masks,
+                positions,
+                rope_cache=rope_cache,
+            )
 
         h = self.norm(h) if self.norm is not None else h
 

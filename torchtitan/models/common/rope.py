@@ -107,6 +107,22 @@ class RoPE(Module):
         original_seq_len: int = 4096
         truncate: bool = True
 
+        def build_cache(self) -> torch.Tensor:
+            return self.build().cache
+
+        def prepare_cache(
+            self,
+            rope_cache: torch.Tensor,
+            *,
+            positions: torch.Tensor | None,
+            num_tokens: int,
+        ) -> torch.Tensor:
+            return prepare_rope_cache(
+                rope_cache,
+                positions=positions,
+                num_tokens=num_tokens,
+            )
+
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
@@ -165,6 +181,18 @@ class RoPE(Module):
         """Apply rotary embeddings to query and key tensors."""
         reshaped_cache = self._reshape_cache(query, positions)
         return self.apply_rotary_emb(query, key, reshaped_cache)
+
+    def prepare_cache(
+        self,
+        *,
+        positions: torch.Tensor | None,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        return self.config.prepare_cache(
+            self.cache,
+            positions=positions,
+            num_tokens=num_tokens,
+        )
 
     def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
         # TODO: In long-term we need to have buffer abstraction in `Module`` class to infer the buffer_device
@@ -366,6 +394,55 @@ def _reshape_for_broadcast(
     else:
         rope_cache = rope_cache[positions]
     return rope_cache.view(num_tokens, 1, cache_width)
+
+
+def _validate_prepare_cache_inputs(
+    positions: torch.Tensor | None,
+    *,
+    num_tokens: int,
+) -> None:
+    if positions is not None and positions.shape[0] != num_tokens:
+        raise ValueError(
+            f"RoPE positions length ({positions.shape[0]}) must match "
+            f"num_tokens ({num_tokens})."
+        )
+
+
+def _maybe_wrap_positions_for_cache(
+    positions: torch.Tensor | None,
+    rope_cache: torch.Tensor,
+) -> torch.Tensor | None:
+    """Wrap plain positions as a DTensor when the raw cache is a DTensor."""
+    if (
+        positions is not None
+        and isinstance(rope_cache, DTensor)
+        and not isinstance(positions, DTensor)
+    ):
+        ndim = positions.ndim
+        placements = tuple(
+            p if not isinstance(p, Shard) or p.dim < ndim else Replicate()
+            for p in rope_cache.placements
+        )
+        positions = DTensor.from_local(
+            positions,
+            rope_cache.device_mesh,
+            placements,
+            run_check=False,
+        )
+    return positions
+
+
+def prepare_rope_cache(
+    rope_cache: torch.Tensor,
+    *,
+    positions: torch.Tensor | None,
+    num_tokens: int,
+) -> torch.Tensor:
+    _validate_prepare_cache_inputs(positions, num_tokens=num_tokens)
+    positions = _maybe_wrap_positions_for_cache(positions, rope_cache)
+    if positions is not None:
+        _maybe_check_max_pos(positions, max_valid_pos=rope_cache.shape[0] - 1)
+    return _reshape_for_broadcast(rope_cache, (num_tokens,), positions)
 
 
 def _maybe_wrap_positions(

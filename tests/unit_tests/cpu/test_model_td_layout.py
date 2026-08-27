@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import unittest
+from unittest import mock
 
 import torch
 import torch.nn as nn
@@ -30,6 +31,21 @@ class _AttentionOutput(nn.Module):
             )
             out_TNH = out_transform(out_TNH, lse_TN)
         return out_TNH
+
+
+def _assert_attention_uses_prepared_rope_cache(testcase, attention, x_TD, positions_T):
+    attention.inner_attention = _AttentionOutput()
+    rope_cache = attention.rope.prepare_cache(
+        positions=positions_T,
+        num_tokens=positions_T.shape[0],
+    )
+    with mock.patch.object(
+        attention.rope,
+        "_reshape_cache",
+        side_effect=AssertionError("_reshape_cache should not run"),
+    ):
+        out_TD = attention(x_TD, None, positions_T, rope_cache=rope_cache)
+    testcase.assertEqual(out_TD.shape, x_TD.shape)
 
 
 class TestModelTDLayout(unittest.TestCase):
@@ -98,6 +114,62 @@ class TestModelTDLayout(unittest.TestCase):
         positions_T = torch.arange(8)
 
         out_TD = attention(x_TD, None, positions_T)
+
+        self.assertEqual(out_TD.shape, x_TD.shape)
+
+    def test_deepseek_attention_uses_prepared_rope_cache(self):
+        config = deepseekv3_configs["debugmodel"]("flex", "standard")
+        attention = config.layers[0].attention.build()
+        x_TD = torch.randn(8, config.dim)
+        positions_T = torch.arange(8)
+
+        _assert_attention_uses_prepared_rope_cache(
+            self,
+            attention,
+            x_TD,
+            positions_T,
+        )
+
+    def test_gpt_oss_attention_uses_prepared_rope_cache(self):
+        config = gptoss_configs["debugmodel"]("standard", "varlen")
+        attention = config.layers[0].attention.build()
+        x_TD = torch.randn(8, config.dim)
+        positions_T = torch.arange(8)
+
+        _assert_attention_uses_prepared_rope_cache(
+            self,
+            attention,
+            x_TD,
+            positions_T,
+        )
+
+    def test_muse_attention_uses_prepared_rope_cache(self):
+        config = muse_glimmer_configs["debugmodel"]("varlen")
+        attention = next(
+            layer.attention.build()
+            for layer in config.layers
+            if layer.attention.use_rope
+        )
+        x_TD = torch.randn(8, config.dim)
+        positions_T = torch.arange(8)
+        attention_masks = {"swa_128": None}
+        rope_cache = attention.rope.prepare_cache(
+            positions=positions_T,
+            num_tokens=positions_T.shape[0],
+        )
+
+        attention.inner_attention = _AttentionOutput()
+        with mock.patch.object(
+            attention.rope,
+            "_reshape_cache",
+            side_effect=AssertionError("_reshape_cache should not run"),
+        ):
+            out_TD = attention(
+                x_TD,
+                attention_masks,
+                positions_T,
+                rope_cache=rope_cache,
+            )
 
         self.assertEqual(out_TD.shape, x_TD.shape)
 
